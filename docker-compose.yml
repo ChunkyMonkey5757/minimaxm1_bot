@@ -1,0 +1,14 @@
+services:
+  minimax:
+    build: .
+    restart: always
+    env_file: .env
+    command: python -m src.main
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
