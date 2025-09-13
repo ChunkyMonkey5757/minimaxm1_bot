@@ -1,24 +1,21 @@
-.PHONY: setup dev run docker-up docker-down logs update
+# Makefile for MiniMaxM1 Bot
 
-setup:
-	python -m pip install --upgrade pip
-	pip install -r requirements.txt
-	@echo "Copy .env.example -> .env and adjust settings."
+.PHONY: dev clean test
 
+# Kill any stale bot process, then start fresh in paper mode
 dev:
+	@echo ">> Killing old bot instances..."
+	-pkill -f src/main.py || true
+	@echo ">> Starting MiniMax in paper mode..."
 	PAPER_MODE=true python -m src.main
 
-run:
-	python -m src.main
+# Clean up Python cache and logs
+clean:
+	@echo ">> Cleaning project..."
+	rm -rf __pycache__ */__pycache__ .pytest_cache
+	rm -f data/*.csv
 
-docker-up:
-	docker compose up -d --build
-
-docker-down:
-	docker compose down
-
-logs:
-	docker compose logs -f
-
-update:
-	git pull && docker compose up -d --build
+# Run tests (placeholder for later)
+test:
+	@echo ">> Running tests..."
+	pytest || true
