@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 # ---------------- Config ----------------
 load_dotenv()
 PAPER_MODE = (os.getenv("PAPER_MODE", "true").lower() == "true")
+
 PRODUCT = os.getenv("PRODUCT", "BTC-USD")
 GRANULARITY = int(os.getenv("GRANULARITY", "60"))
 POLL_SEC = int(os.getenv("POLL_SEC", "10"))
@@ -33,19 +34,26 @@ if not PAPER_MODE:
     for k in ("COINBASE_API_KEY", "COINBASE_API_SECRET", "COINBASE_API_PASSPHRASE"):
         assert os.getenv(k), f"Missing {k} in .env for live mode."
 
-BROKERAGE = "https://api.coinbase.com/api/v3/brokerage"
+# API bases
+BROKERAGE = "https://api.coinbase.com/api/v3/brokerage"     # live only
+EXCHANGE_PUBLIC = "https://api.exchange.coinbase.com"       # paper / public
 
+# Data dir & CSV
 DATA_DIR = pathlib.Path("data"); DATA_DIR.mkdir(exist_ok=True)
 TRADE_CSV = DATA_DIR / "trades.csv"
 if not TRADE_CSV.exists():
     with open(TRADE_CSV, "w", newline="") as f:
         csv.writer(f).writerow(["t","event","price","qty","pnl","equity"])
 
+# ---------------- Utils ----------------
 def now() -> datetime:
     return datetime.now(timezone.utc)
 
 def ts(dt: datetime) -> int:
     return int(dt.timestamp())
+
+def iso(dt: datetime) -> str:
+    return dt.replace(microsecond=0).isoformat()
 
 def tg(msg: str):
     if not TG_TOKEN or not TG_CHAT: return
@@ -65,12 +73,11 @@ def start_healthcheck(port: int):
                          daemon=True)
     t.start()
 
-def http_get(url: str, params: dict, timeout=30, tries=5, backoff=2.0):
-    """GET with simple exponential backoff."""
+def http_get(url: str, params: dict, timeout=30, tries=5, backoff=2.0, headers: Optional[dict]=None):
     last_err = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, params=params, timeout=timeout, headers=headers or {})
             r.raise_for_status()
             return r
         except Exception as e:
@@ -79,31 +86,54 @@ def http_get(url: str, params: dict, timeout=30, tries=5, backoff=2.0):
             time.sleep(sleep)
     raise last_err
 
+# ---------------- Data types ----------------
 @dataclass
 class Candle:
-    start: int; low: float; high: float; open: float; close: float; volume: float
+    start: int
+    low: float
+    high: float
+    open: float
+    close: float
+    volume: float
 
-def get_candles(product: str, granularity: int, lookback_minutes: int=240) -> List[Candle]:
+# ---------------- Market data ----------------
+def get_candles(product: str, granularity: int, lookback_minutes: int = 240) -> List[Candle]:
     end_dt = now()
     start_dt = end_dt - timedelta(minutes=lookback_minutes)
-    r = http_get(f"{BROKERAGE}/products/{product}/candles",
-                 params={"start": ts(start_dt), "end": ts(end_dt), "granularity": granularity})
-    data = r.json().get("candles", [])
-    data.sort(key=lambda x: x["start"])
+
+    if PAPER_MODE:
+        url = f"{EXCHANGE_PUBLIC}/products/{product}/candles"
+        params = {"granularity": granularity}
+        r = http_get(url, params=params)
+        arr = r.json()  # [[time, low, high, open, close, volume], ...]
+        data = [{"start": int(row[0]),
+                 "low": float(row[1]), "high": float(row[2]),
+                 "open": float(row[3]), "close": float(row[4]),
+                 "volume": float(row[5])} for row in arr]
+        data.sort(key=lambda x: x["start"])
+    else:
+        url = f"{BROKERAGE}/products/{product}/candles"
+        params = {"start": int(start_dt.timestamp()), "end": int(end_dt.timestamp()), "granularity": granularity}
+        r = http_get(url, params=params)
+        data = r.json().get("candles", [])
+        data.sort(key=lambda x: x["start"])
+
     return [Candle(**c) for c in data]
 
+# ---------------- Indicators ----------------
 def sma(values: List[float], n: int) -> Optional[float]:
     if len(values) < n: return None
     return float(sum(values[-n:]) / n)
 
 def compute_atr(highs: List[float], lows: List[float], closes: List[float], n: int) -> Optional[float]:
-    if len(closes) < n+1: return None
+    if len(closes) < n + 1: return None
     tr = []
     for i in range(-n, 0):
         h = highs[i]; l = lows[i]; pc = closes[i-1]
-        tr.append(max(h-l, abs(h-pc), abs(l-pc)))
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
     return float(sum(tr) / n)
 
+# ---------------- Portfolio ----------------
 @dataclass
 class Position:
     qty: float
@@ -131,7 +161,6 @@ class Paper:
         eq = self.cash + self.asset * mark
         if eq > self.session_peak_equity:
             self.session_peak_equity = eq
-        # session drawdown pause
         if (self.session_peak_equity - eq) >= SESSION_MAX_DRAWDOWN_USD:
             self.session_paused = True
         return eq
@@ -152,20 +181,24 @@ class Paper:
         self.cash += proceeds
         return proceeds
 
+# ---------------- Logging ----------------
 def log_trade(event: str, price: float, qty: float, pnl: float, equity: float):
     with open(TRADE_CSV, "a", newline="") as f:
-        csv.writer(f).writerow([now().isoformat(), event, f"{price:.2f}", f"{qty:.6f}", f"{pnl:.2f}", f"{equity:.2f}"])
+        csv.writer(f).writerow([now().isoformat(), event,
+                                f"{price:.2f}", f"{qty:.6f}",
+                                f"{pnl:.2f}", f"{equity:.2f}"])
 
+# ---------------- Strategy ----------------
 def crossover_signal(closes: List[float]) -> str:
     f = sma(closes, 20); s = sma(closes, 50)
     if f is None or s is None: return "WARMUP"
-    # lookback one bar for fresh cross
     f1 = sma(closes[:-1], 20); s1 = sma(closes[:-1], 50)
     if f1 is None or s1 is None: return "WARMUP"
     if f1 <= s1 and f > s: return "BUY"
     if f1 >= s1 and f < s: return "SELL"
     return "HOLD"
 
+# ---------------- Runner ----------------
 def run():
     start_healthcheck(HEALTH_PORT)
     tg("MiniMax: starting ✅")
@@ -173,14 +206,12 @@ def run():
     state = Paper(cash=START_CASH, session_peak_equity=START_CASH)
     last_bar_start = 0
 
-    # prime history
     hist = get_candles(PRODUCT, GRANULARITY, lookback_minutes=300)
     highs = [c.high for c in hist]; lows = [c.low for c in hist]; closes = [c.close for c in hist]
     if hist: last_bar_start = hist[-1].start
 
     while True:
         try:
-            # fetch rolling window to avoid gaps
             new = get_candles(PRODUCT, GRANULARITY, lookback_minutes=180)
             fresh = [c for c in new if c.start > last_bar_start]
             if not fresh:
@@ -193,12 +224,10 @@ def run():
                 price = closes[-1]
                 eq = state.equity(price)
 
-                # session pause? do nothing except heartbeat
                 if state.session_paused:
-                    print(f"[{datetime.fromtimestamp(last_bar_start, tz=timezone.utc).isoformat()}] SESSION-PAUSED dd_limit hit | px={price:.2f} eq={eq:.2f}")
+                    print(f"[{datetime.fromtimestamp(last_bar_start, tz=timezone.utc).isoformat()}] SESSION-PAUSED | px={price:.2f} eq={eq:.2f}")
                     continue
 
-                # risk controls on open position
                 if state.pos:
                     if price <= state.pos.stop:
                         proceeds = state.sell_qty(state.pos.stop, state.pos.qty)
@@ -207,8 +236,7 @@ def run():
                         log_trade("STOP", state.pos.stop, state.pos.qty, pnl, state.equity(state.pos.stop))
                         state.pos = None
                         state.cooldown_left = COOLDOWN_BARS
-                        print(f"STOP @ {state.pos.stop if state.pos else 0:.2f} | eq={state.equity(price):.2f}")
-                        # continue to next bar
+                        print(f"STOP @ {price:.2f} | eq={state.equity(price):.2f}")
                         continue
                     if state.pos.tp and price >= state.pos.tp:
                         proceeds = state.sell_qty(state.pos.tp, state.pos.qty)
@@ -221,8 +249,6 @@ def run():
                         continue
 
                 sig = crossover_signal(closes)
-
-                # cooldown & loss-streak gating
                 if state.cooldown_left > 0:
                     state.cooldown_left -= 1
                     sig = "HOLD"
@@ -231,15 +257,12 @@ def run():
 
                 if sig == "BUY" and not state.pos:
                     atr_now = compute_atr(highs, lows, closes, ATR_LEN)
-                    # fallback if ATR not ready
                     if atr_now is None or atr_now <= 0:
                         stop = price * 0.994
                     else:
                         stop = price - ATR_MULT * atr_now
-                        if stop >= price:
-                            stop = price * 0.994
+                        if stop >= price: stop = price * 0.994
                     usd_risk = max(MIN_TRADE_USD, state.equity(price) * RISK_PCT)
-                    # size calc
                     risk_per_unit = max(1e-8, price - stop)
                     qty_by_risk = usd_risk / risk_per_unit
                     max_qty_by_cap = (min(MAX_POSITION_USD, state.cash * 0.98)) / price
@@ -247,7 +270,7 @@ def run():
                     if qty > 0:
                         spent = qty * price
                         got = state.buy_usd(price, spent)
-                        tp = price * 1.01  # simple 1% TP (tune later)
+                        tp = price * 1.01
                         state.pos = Position(qty=got, entry=price, stop=stop, tp=tp)
                         log_trade("BUY", price, got, 0.0, state.equity(price))
                         print(f"BUY  @ {price:.2f} | qty={got:.6f} stop={stop:.2f} tp={tp:.2f} | eq={state.equity(price):.2f}")
@@ -283,3 +306,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+    
